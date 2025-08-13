@@ -1,1 +1,3 @@
-from .controller import KLController
+from .controller import KLController, KLControllerState
+from .multiplicative import MultiplicativeKLController, MultiplicativeKLControllerConfig, MultiplicativeKLControllerState
+from .lagrangian import LagrangianKLController, LagrangianKLControllerConfig, LagrangianKLControllerState

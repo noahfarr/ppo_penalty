@@ -71,12 +71,6 @@ class PPOConfig:
     vf_coef: float = 0.5
     max_grad_norm: float = 0.5
 
-    target_kl: float = 0.01
-    kl_beta_init: float = 1.0
-    kl_adapt_scale: float = 1.5
-    kl_beta_up: float = 2.0
-    kl_beta_down: float = 0.5
-
     @property
     def batch_size(self):
         return self.num_envs * self.num_steps
@@ -91,7 +85,7 @@ class PPOState:
     actor_optimizer_state: optax.OptState
     critic_params: core.FrozenDict[str, Any]
     critic_optimizer_state: optax.OptState
-    kl_beta: float
+    kl_controller_state: KLControllerState
 
 
 @chex.dataclass(frozen=True)
@@ -388,7 +382,7 @@ class PPO:
 if __name__ == "__main__":
     seed = 0
     cfg = PPOConfig()
-    env, env_params = gymnax.make("CartPole-v1")
+    env, env_params = gymnax.make("Breakout-MinAtar")
     env = LogWrapper(env)
     env = FlattenObservationWrapper(env)
 

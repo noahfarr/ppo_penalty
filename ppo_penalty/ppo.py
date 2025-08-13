@@ -10,7 +10,6 @@ import distrax
 import optax
 from flax import core
 
-
 class Actor(nn.Module):
     action_dim: int
 
@@ -51,26 +50,28 @@ class Transition:
 
 @chex.dataclass
 class PPOConfig:
-    num_envs: int = 4
-    num_eval_envs: int = 4
+    num_envs: int = 64
+    num_eval_envs: int = 64
     num_steps: int = 128
-    total_timesteps: int = int(5e5)
+    total_timesteps: int = int(1e5)
     num_train_steps: int = 100_000
     normalize_advantage: bool = True
-    batch_size: int = 64
     clip_vloss: bool = True
-
     num_evaluation_steps: int = 10_000
-    learning_rate: float = 2.5e-4
+    learning_rate: float = 3e-4
     update_epochs: int = 4
-    num_minibatches: int = 4
+    num_minibatches: int = 8
     anneal_lr: bool = True
     gamma: float = 0.99
     gae_lambda: float = 0.95
-    clip_coef: float = 0.2
     ent_coef: float = 0.01
+    clip_coef: float = 0.2
     vf_coef: float = 0.5
     max_grad_norm: float = 0.5
+
+    @property
+    def batch_size(self):
+        return self.num_envs * self.num_steps
 
 
 @chex.dataclass(frozen=True)
@@ -107,6 +108,7 @@ class PPO:
         critic_params = self.critic.init(critic_key, obs)
         critic_optimizer_state = self.optimizer.init(critic_params)
 
+
         return (
             key,
             PPOState(
@@ -119,207 +121,209 @@ class PPO:
                 critic_optimizer_state=critic_optimizer_state,  # type: ignore
             ),
         )
+    def compute_gae(
+        self, gamma: float, gae_lambda: float, final_value: jax.Array, transitions
+    ):
+        """Compute Generalized Advantage Estimates (GAE) for a trajectory."""
+
+        def f(carry, transition):
+            advantage, value = carry
+            delta = (
+                transition.reward
+                + gamma * value * (1 - transition.done)
+                - transition.value
+            )
+            advantage = (
+                delta + gamma * gae_lambda * (1 - transition.done) * advantage
+            )
+            return (advantage, transition.value), advantage
+
+        _, advantages = jax.lax.scan(
+            f,
+            (jnp.zeros_like(final_value), final_value),
+            transitions,
+            reverse=True,
+        )
+        returns = advantages + transitions.value
+        return advantages, returns
+
+    def step(self, carry: tuple, _):
+        key, state = carry
+
+        key, action_key, step_key = jax.random.split(key, 3)
+
+        probs = self.actor.apply(state.actor_params, state.obs)
+        action = probs.sample(seed=action_key)
+        log_prob = probs.log_prob(action)
+
+        value = self.critic.apply(state.critic_params, state.obs)
+
+        step_key = jax.random.split(step_key, self.cfg.num_envs)
+        next_obs, env_state, reward, done, info = jax.vmap(
+            self.env.step, in_axes=(0, 0, 0, None)
+        )(step_key, state.env_state, action, self.env_params)
+
+        transition = Transition(
+            observation=state.obs,  # type: ignore
+            action=action,  # type: ignore
+            reward=reward,  # type: ignore
+            done=done,  # type: ignore
+            info=info,  # type: ignore
+            log_prob=log_prob,  # type: ignore
+            value=value,  # type: ignore
+        )
+
+        state = state.replace(
+            step=state.step + self.cfg.num_envs,
+            obs=next_obs,
+            env_state=env_state,
+        )
+        carry = (
+            key,
+            state,
+        )
+        return carry, transition
+
+    def actor_loss_fn(self, params, transitions, advantages):
+        probs = self.actor.apply(params, transitions.observation)
+        log_prob = probs.log_prob(transitions.action)
+        entropy = probs.entropy().mean()
+
+        ratio = jnp.exp(log_prob - transitions.log_prob)
+
+        actor_loss = -jnp.minimum(
+            ratio * advantages,
+            jnp.clip(
+                ratio,
+                1.0 - self.cfg.clip_coef,
+                1.0 + self.cfg.clip_coef,
+            )
+            * advantages,
+        ).mean()
+        return actor_loss, {"entropy": entropy}
+
+    def critic_loss_fn(self, params, transitions, advantages, returns):
+        value = self.critic.apply(params, transitions.observation)
+
+        if self.cfg.clip_vloss:
+            critic_loss = jnp.square(value - returns)
+            clipped_value = transitions.value + jnp.clip(
+                (value - transitions.value),
+                -self.cfg.clip_coef,
+                self.cfg.clip_coef,
+            )
+            clipped_critic_loss = jnp.square(clipped_value - returns)
+            critic_loss = (
+                0.5
+                * jnp.maximum(critic_loss, clipped_critic_loss).mean()
+            )
+        else:
+            critic_loss = 0.5 * jnp.square(value - returns).mean()
+
+        return self.cfg.vf_coef * critic_loss
+
+    def update_minibatch(self, state, minibatch: tuple):
+        transitions, advantages, returns = minibatch
+
+        (actor_loss, aux), actor_grads = jax.value_and_grad(
+            self.actor_loss_fn, has_aux=True
+        )(state.actor_params, transitions, advantages)
+        actor_updates, actor_optimizer_state = self.optimizer.update(
+            actor_grads, state.actor_optimizer_state, state.actor_params
+        )
+        actor_params = optax.apply_updates(
+            state.actor_params, actor_updates
+        )
+
+        critic_loss, critic_grads = jax.value_and_grad(self.critic_loss_fn)(
+            state.critic_params, transitions, advantages, returns
+        )
+        critic_updates, critic_optimizer_state = self.optimizer.update(
+            critic_grads, state.critic_optimizer_state, state.critic_params
+        )
+        critic_params = optax.apply_updates(
+            state.critic_params, critic_updates
+        )
+
+
+        state = state.replace(
+            actor_params=actor_params,
+            actor_optimizer_state=actor_optimizer_state,
+            critic_params=critic_params,
+            critic_optimizer_state=critic_optimizer_state,
+        )
+        return state, (actor_loss, critic_loss)
+
+    def update_epoch(self, carry: tuple, _):
+        key, state, batch = carry
+
+        key, permutation_key = jax.random.split(key)
+
+        permutation = jax.random.permutation(
+            permutation_key, self.cfg.batch_size
+        )
+        flattened_batch = jax.tree.map(
+            lambda x: x.reshape(-1, *x.shape[2:]), batch
+        )
+        shuffled_batch = jax.tree.map(
+            lambda x: jnp.take(x, permutation, axis=0), flattened_batch
+        )
+        minibatches = jax.tree.map(
+            lambda x: jnp.reshape(
+                x, [self.cfg.num_minibatches, -1] + list(x.shape[1:])
+            ),
+            shuffled_batch,
+        )
+
+        state, loss = jax.lax.scan(
+            self.update_minibatch,
+            state,
+            minibatches,
+        )
+
+        return (
+            key,
+            state,
+            batch,
+        ), loss
+
+    def update_step(self, carry: tuple, _):
+
+        (key, state), transitions = jax.lax.scan(
+            self.step,
+            carry,
+            length=self.cfg.num_steps,
+        )
+        final_value = self.critic.apply(state.critic_params, state.obs)
+
+        advantages, returns = self.compute_gae(
+            self.cfg.gamma,
+            self.cfg.gae_lambda,
+            final_value,
+            transitions,
+        )
+
+        if self.cfg.normalize_advantage:
+            advantages = (advantages - advantages.mean()) / (
+                advantages.std() + 1e-8
+            )
+
+        batch = (transitions, advantages, returns)
+
+
+        (key, state, batch), (actor_loss, critic_loss) = jax.lax.scan(
+            self.update_epoch,
+            (key, state, batch),
+            length=self.cfg.update_epochs,
+        )
+        transitions, *_ = batch
+
+        return (key, state), transitions.info
 
     def train(self, key, state, num_steps):
 
-        def update_step(carry: tuple, _):
-
-            def compute_gae(
-                gamma: float, gae_lambda: float, final_value: jax.Array, transitions
-            ):
-                """Compute Generalized Advantage Estimates (GAE) for a trajectory."""
-
-                def f(carry, transition):
-                    advantage, value = carry
-                    delta = (
-                        transition.reward
-                        + gamma * value * (1 - transition.done)
-                        - transition.value
-                    )
-                    advantage = (
-                        delta + gamma * gae_lambda * (1 - transition.done) * advantage
-                    )
-                    return (advantage, transition.value), advantage
-
-                _, advantages = jax.lax.scan(
-                    f,
-                    (jnp.zeros_like(final_value), final_value),
-                    transitions,
-                    reverse=True,
-                )
-                returns = advantages + transitions.value
-                return advantages, returns
-
-            def step(carry: tuple, _):
-                key, state = carry
-
-                key, action_key, step_key = jax.random.split(key, 3)
-
-                probs = self.actor.apply(state.actor_params, state.obs)
-                action = probs.sample(seed=action_key)
-                log_prob = probs.log_prob(action)
-
-                value = self.critic.apply(state.critic_params, state.obs)
-
-                step_key = jax.random.split(step_key, self.cfg.num_envs)
-                next_obs, env_state, reward, done, info = jax.vmap(
-                    self.env.step, in_axes=(0, 0, 0, None)
-                )(step_key, state.env_state, action, self.env_params)
-
-                transition = Transition(
-                    observation=state.obs,  # type: ignore
-                    action=action,  # type: ignore
-                    reward=reward,  # type: ignore
-                    done=done,  # type: ignore
-                    info=info,  # type: ignore
-                    log_prob=log_prob,  # type: ignore
-                    value=value,  # type: ignore
-                )
-
-                state = state.replace(
-                    step=state.step + self.cfg.num_envs,
-                    obs=next_obs,
-                    env_state=env_state,
-                )
-                carry = (
-                    key,
-                    state,
-                )
-                return carry, transition
-
-            (key, state), transitions = jax.lax.scan(
-                step,
-                carry,
-                length=self.cfg.num_steps,
-            )
-            final_value = self.critic.apply(state.critic_params, state.obs)
-
-            advantages, returns = compute_gae(
-                self.cfg.gamma,
-                self.cfg.gae_lambda,
-                final_value,
-                transitions,
-            )
-
-            if self.cfg.normalize_advantage:
-                advantages = (advantages - advantages.mean()) / (
-                    advantages.std() + 1e-8
-                )
-
-            batch = (transitions, advantages, returns)
-
-            def update_epoch(carry: tuple, _):
-                key, state, batch = carry
-
-                def update_minibatch(state, minibatch: tuple):
-                    transitions, advantages, returns = minibatch
-
-                    def actor_loss_fn(params, transitions, advantages):
-                        probs = self.actor.apply(params, transitions.observation)
-                        log_prob = probs.log_prob(transitions.action)
-                        entropy = probs.entropy().mean()
-
-                        ratio = jnp.exp(log_prob - transitions.log_prob)
-                        actor_loss = -jnp.minimum(
-                            ratio * advantages,
-                            jnp.clip(
-                                ratio,
-                                1.0 - self.cfg.clip_coef,
-                                1.0 + self.cfg.clip_coef,
-                            )
-                            * advantages,
-                        ).mean()
-                        return actor_loss - self.cfg.ent_coef * entropy
-
-                    def critic_loss_fn(params, transitions, advantages, returns):
-                        value = self.critic.apply(params, transitions.observation)
-
-                        if self.cfg.clip_vloss:
-                            critic_loss = jnp.square(value - returns)
-                            clipped_value = transitions.value + jnp.clip(
-                                (value - transitions.value),
-                                -self.cfg.clip_coef,
-                                self.cfg.clip_coef,
-                            )
-                            clipped_critic_loss = jnp.square(clipped_value - returns)
-                            critic_loss = (
-                                0.5
-                                * jnp.maximum(critic_loss, clipped_critic_loss).mean()
-                            )
-                        else:
-                            critic_loss = 0.5 * jnp.square(value - returns).mean()
-
-                        return self.cfg.vf_coef * critic_loss
-
-                    actor_loss, actor_grads = jax.value_and_grad(actor_loss_fn)(
-                        state.actor_params, transitions, advantages
-                    )
-                    actor_updates, actor_optimizer_state = self.optimizer.update(
-                        actor_grads, state.actor_optimizer_state, state.actor_params
-                    )
-                    acotr_params = optax.apply_updates(
-                        state.actor_params, actor_updates
-                    )
-
-                    critic_loss, critic_grads = jax.value_and_grad(critic_loss_fn)(
-                        state.critic_params, transitions, advantages, returns
-                    )
-                    critic_updates, critic_optimizer_state = self.optimizer.update(
-                        critic_grads, state.critic_optimizer_state, state.critic_params
-                    )
-                    critic_params = optax.apply_updates(
-                        state.critic_params, critic_updates
-                    )
-
-                    state = state.replace(
-                        actor_params=acotr_params,
-                        actor_optimizer_state=actor_optimizer_state,
-                        critic_params=critic_params,
-                        critic_optimizer_state=critic_optimizer_state,
-                    )
-                    return state, (actor_loss, critic_loss)
-
-                key, permutation_key = jax.random.split(key)
-
-                permutation = jax.random.permutation(
-                    permutation_key, self.cfg.batch_size
-                )
-                flattened_batch = jax.tree.map(
-                    lambda x: x.reshape(-1, *x.shape[2:]), batch
-                )
-                shuffled_batch = jax.tree.map(
-                    lambda x: jnp.take(x, permutation, axis=0), flattened_batch
-                )
-                minibatches = jax.tree.map(
-                    lambda x: jnp.reshape(
-                        x, [self.cfg.num_minibatches, -1] + list(x.shape[1:])
-                    ),
-                    shuffled_batch,
-                )
-
-                state, loss = jax.lax.scan(
-                    update_minibatch,
-                    state,
-                    minibatches,
-                )
-
-                return (
-                    key,
-                    state,
-                    batch,
-                ), loss
-
-            (key, state, batch), (actor_loss, critic_loss) = jax.lax.scan(
-                update_epoch,
-                (key, state, batch),
-                length=self.cfg.update_epochs,
-            )
-            transitions, *_ = batch
-
-            return (key, state), transitions.info
-
         (key, state), info = jax.lax.scan(
-            update_step,
+            self.update_step,
             (key, state),
             length=num_steps // self.cfg.num_envs // self.cfg.num_steps,
         )
@@ -356,6 +360,7 @@ class PPO:
 
 if __name__ == "__main__":
     seed = 0
+
     cfg = PPOConfig()
     env, env_params = gymnax.make("CartPole-v1")
     env = LogWrapper(env)
@@ -381,6 +386,7 @@ if __name__ == "__main__":
         optax.clip_by_global_norm(cfg.max_grad_norm),
         optax.adam(learning_rate=learning_rate, eps=1e-5),
     )
+
 
     agent = PPO(
         cfg=cfg,

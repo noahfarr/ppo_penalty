@@ -203,12 +203,12 @@ class PPO:
         return actor_loss, {"entropy": entropy}
 
     def critic_loss_fn(self, params, transitions, advantages, returns):
-        value = self.critic.apply(params, transitions.observation)
+        values = self.critic.apply(params, transitions.observation)
 
         if self.cfg.clip_vloss:
-            critic_loss = jnp.square(value - returns)
+            critic_loss = jnp.square(values - returns)
             clipped_value = transitions.value + jnp.clip(
-                (value - transitions.value),
+                (values - transitions.value),
                 -self.cfg.clip_coef,
                 self.cfg.clip_coef,
             )
